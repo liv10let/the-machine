@@ -1,0 +1,8 @@
+.env
+focus-guard-logs/
+focus-guard-cooldown.json
+focus-guard-interactions.jsonl
+venv/
+__pycache__/
+*.pyc
+.DS_Store
