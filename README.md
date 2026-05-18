@@ -16,44 +16,146 @@
 ## 运行架构
 
 ```
-┌─────────────────┐     cron 每5分钟      ┌──────────────┐
-│ 飞书日历 API    │ ──────────────────→ │ focus-guard  │
-│ (当前日程)      │                     │ (检测逻辑)    │
-└─────────────────┘                     └──────┬───────┘
-                                               │
-                    ┌──────────────────────────┼──────────┐
-                    │                          │          │
-              ┌─────▼─────┐           ┌──────▼──────┐ ┌──▼────────┐
-              │ AW PC端   │           │ AW AFK      │ │ AW Android│
-              │ 浏览器/窗口│           │ 离开检测    │ │ 手机活动  │
-              └───────────┘           └─────────────┘ └───────────┘
-                    │                          │
-                    │         AFK 时跳过 PC     │
-                    └──────────────────────────┘
-                                               │
-                                        ┌─────▼─────┐
-                                        │ 飞书卡片  │
-                                        │ 分心提醒  │
-                                        └───────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         数据采集端（各端魔改 watcher）                          │
+├──────────────┬──────────────┬──────────────┬──────────────┬─────────────────┤
+│   PC 浏览器   │   PC 窗口     │   PC AFK     │  Android 手机 │   VS Code       │
+│              │              │              │              │                 │
+│ 魔改浏览器插件 │ 魔改窗口监听  │  魔改AFK监听  │  aw-android-  │  魔改VSCode插件  │
+│  TypeScript  │   Kotlin     │   Python     │    plus      │   TypeScript    │
+└──────┬───────┴──────┬───────┴──────┬───────┴──────┬───────┴────────┬────────┘
+       │              │              │              │                 │
+       └──────────────┴──────────────┴──────────────┴─────────────────┘
+                                    │
+                              HTTP POST (带 Basic Auth)
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          数据汇聚层（远程 AW Server）                         │
+│                                                                             │
+│   运行在远程服务器的 aw-server-rust，接收并存储所有 watcher 的心跳数据       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                              HTTP GET
+                           (focus-guard.py 查询)
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          检测层（The Machine）                               │
+│                                                                             │
+│   1. 查询飞书日历 → 是否有工作/学习日程？                                    │
+│   2. 查询 AFK bucket → 用户是否在电脑前？                                    │
+│   3. AFK 时跳过 PC 端 bucket（浏览器 + 窗口）                               │
+│   4. 查询 Android bucket → 手机是否在分心？                                  │
+│   5. 命中后发送飞书卡片提醒                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 快速开始
+## 这不是标准的 ActivityWatch
 
-### 1. 前置依赖
+⚠️ **重要说明**：本系统依赖的不是官方 ActivityWatch，而是**魔改版 watcher**，它们将数据从各端设备**实时转发到远程服务器**上。标准 ActivityWatch 只在本地存储数据，无法被远程检测。
+
+### 数据链路全景
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         数据采集端（各端魔改 watcher）                          │
+├──────────────┬──────────────┬──────────────┬──────────────┬─────────────────┤
+│   PC 浏览器   │   PC 窗口     │   PC AFK     │  Android 手机 │   VS Code       │
+│              │              │              │              │                 │
+│ 魔改浏览器插件 │ 魔改窗口监听  │  魔改AFK监听  │  aw-android-  │  魔改VSCode插件  │
+│  TypeScript  │   Kotlin     │   Python     │    plus      │   TypeScript    │
+└──────┬───────┴──────┬───────┴──────┬───────┴──────┬───────┴────────┬────────┘
+       │              │              │              │                 │
+       └──────────────┴──────────────┴──────────────┴─────────────────┘
+                                    │
+                              HTTP POST
+                            (带 Basic Auth)
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          数据汇聚层（远程 AW Server）                         │
+│                                                                             │
+│   运行在远程服务器的 aw-server-rust，接收并存储所有 watcher 的心跳数据       │
+│   通过 nginx 反向代理 + Basic Auth 提供安全访问                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                              HTTP GET
+                           (focus-guard.py 查询)
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          检测层（The Machine）                               │
+│                                                                             │
+│   focus-guard.py 通过 AW API 拉取各 bucket 的最近事件                         │
+│   结合飞书日历判断是否有工作/学习日程                                          │
+│   结合 AFK 状态智能过滤误报                                                  │
+│   命中分心行为后发送飞书卡片提醒                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 各端 watcher 与对应仓库
+
+| 数据源 | Bucket 名称 | 魔改仓库 | 魔改内容 | 语言 |
+|--------|------------|----------|---------|------|
+| **PC 浏览器** | `aw-watcher-web-firefox_server` | [aw-watcher-web-firefox](https://github.com/liv10let/aw-watcher-web-firefox) | 将心跳数据从本地转发到远程服务器，支持自定义 URL | TypeScript |
+| **PC 窗口** | `aw-watcher-window_HAL-9000` | [aw-watcher-window-crossplatform](https://github.com/liv10let/aw-watcher-window-crossplatform) | 跨平台窗口监听 + 远程 HTTP 转发 | Kotlin |
+| **PC AFK** | `aw-watcher-afk_HAL-9000` | [aw-watcher-afk](https://github.com/liv10let/aw-watcher-afk) | 键盘鼠标活动检测 + 远程 HTTP 转发 | Python |
+| **Android 实时** | `aw-watcher-android-realtime` | [aw-android-plus](https://github.com/liv10let/aw-android-plus) | AccessibilityService 实时 App 切换 + 远程 HTTP 转发 + AFK 检测 | Kotlin |
+| **VS Code** | `aw-watcher-vscode` | [aw-watcher-vscode](https://github.com/liv10let/aw-watcher-vscode) | 编辑器活动监听 + 远程 HTTP 转发 + 登录功能防数据泄露 | TypeScript |
+
+> **HAL-9000** 是 bucket 的后缀名，对应设备名。如果你有多个设备，每台设备的 watcher 都会带上各自的主机名后缀。
+
+### 远程服务器搭建
+
+所有魔改 watcher 的数据都汇聚到一台远程服务器上的 `aw-server-rust`：
+
+```nginx
+# nginx 配置示例：反向代理 + Basic Auth
+server {
+    listen 5601;
+    auth_basic "ActivityWatch";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+    location / {
+        proxy_pass http://127.0.0.1:5600;
+    }
+}
+```
+
+客户端 watcher 配置远程地址：`http://your-server:5601`，带上 Basic Auth 凭证。
+
+## 前置依赖
+
+### 服务端（必选）
+
+- [aw-server-rust](https://github.com/ActivityWatch/aw-server-rust) 运行在远程服务器
+- nginx 反向代理（推荐，用于 Basic Auth 和 SSL）
+
+### 客户端（至少选一个）
+
+你需要在要监控的设备上安装对应的魔改 watcher：
+
+| 你想监控的设备 | 需要安装的仓库 |
+|--------------|--------------|
+| PC 浏览器 | [aw-watcher-web-firefox](https://github.com/liv10let/aw-watcher-web-firefox) |
+| PC 窗口 + AFK | [aw-watcher-window-crossplatform](https://github.com/liv10let/aw-watcher-window-crossplatform) + [aw-watcher-afk](https://github.com/liv10let/aw-watcher-afk) |
+| Android 手机 | [aw-android-plus](https://github.com/liv10let/aw-android-plus) |
+| VS Code | [aw-watcher-vscode](https://github.com/liv10let/aw-watcher-vscode) |
+
+### The Machine 本体
 
 - Python 3.8+
-- [ActivityWatch](https://activitywatch.net/) 服务端（本地或远程）
 - [lark-cli](https://github.com/openclaw/openclaw/tree/main/clients/lark-cli)（用于读取飞书日历）
 - 飞书自建应用（用于发送消息卡片）
+- `python-dateutil`（`pip install python-dateutil`）
 
-### 2. 安装
+## 安装
 
 ```bash
 git clone https://github.com/liv10let/the-machine.git
 cd the-machine
-# 可选：创建虚拟环境
 python -m venv venv && source venv/bin/activate
-pip install python-dateutil  # 唯一的外部依赖
+pip install python-dateutil
 ```
 
 ### 3. 配置
@@ -134,14 +236,32 @@ cat focus-guard-logs/$(date +%Y-%m-%d).log | jq 'select(.event=="distraction_fou
 cat focus-guard-logs/$(date +%Y-%m-%d).log | jq -s '[.[] | select(.event=="false_alarm")] | length'
 ```
 
-## AFK 检测原理
+## AFK 检测原理（防误报关键）
 
 ```
-1. 查询 aw-watcher-afk 最近事件
-2. 检查当前时刻是否落在 AFK 事件区间内
-3. 如果是 AFK → 跳过 PC 端 bucket（浏览器 + 窗口）
-4. 手机端 bucket 不受影响（手机使用不依赖电脑状态）
+1. 查询 aw-watcher-afk_HAL-9000 最近事件
+2. 检查当前时刻是否落在 AFK 事件区间内（status == "afk"）
+3. 如果是 AFK → 跳过 PC 端 bucket：
+   - aw-watcher-web-firefox_server（浏览器）
+   - aw-watcher-window_HAL-9000（窗口）
+4. 手机端 bucket 不受影响：
+   - aw-watcher-android-realtime（Android 实时 App 切换）
 ```
+
+> **为什么这样设计？** 当用户离开电脑时，浏览器可能还停留在一个分心网站上（如 jandan.net），但这不代表用户正在浏览。通过 `aw-watcher-afk` 的键盘/鼠标活动检测，可以准确判断用户是否还在电脑前。
+
+## 各端 bucket 与配置
+
+focus-guard.py 默认监控以下 bucket：
+
+| Bucket | 数据来源 | 魔改仓库 | 说明 |
+|--------|---------|----------|------|
+| `aw-watcher-web-firefox_server` | PC Firefox | [aw-watcher-web-firefox](https://github.com/liv10let/aw-watcher-web-firefox) | 浏览器标签页和 URL |
+| `aw-watcher-window_HAL-9000` | PC 窗口 | [aw-watcher-window-crossplatform](https://github.com/liv10let/aw-watcher-window-crossplatform) | 当前活跃窗口标题 |
+| `aw-watcher-afk_HAL-9000` | PC AFK | [aw-watcher-afk](https://github.com/liv10let/aw-watcher-afk) | 键盘鼠标活动状态 |
+| `aw-watcher-android-realtime` | Android | [aw-android-plus](https://github.com/liv10let/aw-android-plus) | 实时 App 切换（AccessibilityService） |
+
+> **HAL-9000** 是你的设备名。如果你有多个设备，每台设备的 watcher 都会生成带各自主机名后缀的 bucket。在 `focus-guard.py` 中修改 bucket 名称以匹配你的设备名。
 
 ## 自定义
 
